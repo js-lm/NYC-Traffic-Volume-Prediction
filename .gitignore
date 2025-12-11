@@ -1,0 +1,7 @@
+.vscode
+build
+.DS_Store
+*.csv
+output
+sample_csv
+csv
