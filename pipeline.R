@@ -76,6 +76,11 @@ data <- data %>%
     Wind_Speed_100m = wind_speed_100m..km.h.
   )
 
+
+train_index <- createDataPartition(data$road_group, p = 0.8, list = FALSE)
+traindata <- data[train_index, ]
+testdata  <- data[-train_index, ]
+
 rec_fixed <- rec %>%
   update_role(all_of("volume"), new_role = "outcome") %>%
   step_novel(all_nominal_predictors()) %>%
@@ -90,7 +95,7 @@ X_test  <- bake(rec_fixed, new_data = testdata) %>% select(-volume)
 
 # Define XGBoost Model
 xgb_spec = boost_tree(
-  trees = 200,
+  trees = 150,
   tree_depth= tune(),
   min_n = tune(),
   learn_rate=tune(),
@@ -114,11 +119,11 @@ params <- parameters(
 )
 
 # Cross validation split
-cv_splits <- vfold_cv(traindata, v = 4)
+cv_splits <- vfold_cv(traindata, v = 5)
 
 # hyperparameter grid
 grid <- grid_space_filling( params ,
-  size = 30
+  size = 20
 )
 
 ctrl <- control_grid(
@@ -166,79 +171,73 @@ cat("Primary Model Test RMSE:", rmse_test, "\n")
 
 # 2. Train secondary models by road group
 road_groups <- unique(traindata$road_group)
-
-#commented out grids for hyperparameters i am happy with
-secondary_grids <- list(
-  "Belt Parkway" = expand_grid( 
-   tree_depth = 3:4,
-  learn_rate = c(0.01, 0.02),
-   min_n = c(10, 15, 20),
-  loss_reduction = c(0.01, 0.05, 0.1),
-  mtry = 2:5
-  ),
-  "Major Deegan" = expand_grid(
-    tree_depth = 3:4,
-    learn_rate = c(0.01,.02),
-    min_n = c(15, 20,25),
-    loss_reduction = c(0.03, 0.05,.1),
-    mtry = 2:4
-  ),
-  "BQE" = expand_grid(
-    tree_depth = 3:4,
-    learn_rate = c(0.008, 0.01,.02),
-    min_n = c(15, 20,25),
-    loss_reduction = c(0.03,.05, 0.1),
-    mtry = 2:5
-  ),
-  "Cross Bronx Expressway" = expand_grid(
-   tree_depth = 3:4,
-    learn_rate = c(0.005, 0.01,.2),
-    min_n = c(10,15,20),
-    loss_reduction = c(0.1, 0.5),  # higher because original best was 0.5
-    mtry = 2:5
-  )
-)
-
-
 secondary_models <- list()
 
+# Ensure residual column exists
+traindata <- traindata %>% mutate(residual = volume - pred_primary)
 
 for (rg in road_groups) {
   cat("Training secondary model for", rg, "\n")
   
-  # Subset train data for this road group
+  # Subset training data for this road group
   train_rg <- traindata %>% filter(road_group == rg)
 
-  # Define recipe for residuals
+  
+  
+  # Prepare predictors for residual model
+  predictor_cols <- train_rg %>% select(-volume, -pred_primary, -road_group, -time)
+  n_predictors <- ncol(predictor_cols)
+  
+  # Dynamic mtry range: 50%-100% of predictors, minimum 2
+  mtry_min <- max(2, floor(0.5 * n_predictors))
+  mtry_max <- n_predictors
+  mmtry_grid <- seq(mtry_min, mtry_max, by = 2)
+  
+  
+  # Build residual recipe
   rec_resid <- recipe(residual ~ ., data = train_rg) %>%
-    step_rm(volume, pred_primary, road_group, time) %>%   # remove non-predictors
+    step_rm(volume, pred_primary, road_group, time) %>%
     step_dummy(all_nominal_predictors())
   
-  # XGBoost model with hyperparameters to tune
+  # Define hyperparameter grid per road group
+  grid_rg <- expand_grid(
+    tree_depth = 2:4,
+    min_n = c(15, 20),
+    learn_rate = c(0.005, 0.01, 0.02),
+    loss_reduction = c(0.01, 0.05, 0.1),
+    mtry = mtry_grid
+  )
+  
+  # XGBoost model with tunable parameters
   xgb_resid <- boost_tree(
-    trees = 200,
+    trees = 30,
     tree_depth = tune(),
-    learn_rate = tune(),
     min_n = tune(),
+    learn_rate = tune(),
     loss_reduction = tune(),
     mtry = tune()
   ) %>%
     set_mode("regression") %>%
-    set_engine("xgboost")
+    set_engine(
+      "xgboost",
+      nthread = parallel::detectCores(),
+      early_stopping_rounds = 15,
+      eval_metric = "rmse"
+    )
   
   # Workflow
   wf_resid <- workflow() %>%
     add_recipe(rec_resid) %>%
     add_model(xgb_resid)
   
-  #  CV for tuning
-  cv_splits_rg <- vfold_cv(train_rg, v = 4)
+  # Cross-validation
+  cv_splits_rg <- vfold_cv(train_rg, v = 3)
   
-  # Tune the grid
+  # Tune grid
   tune_res_rg <- tune_grid(
-   wf_resid,
+    wf_resid,
     resamples = cv_splits_rg,
-   grid = secondary_grids[[rg]],
+    grid = grid_rg,
     metrics = metric_set(rmse),
     control = control_grid(save_pred = TRUE)
   )
@@ -254,11 +253,10 @@ for (rg in road_groups) {
   # Fit final model
   fit_resid <- fit(final_wf_resid, data = train_rg)
   
-  # Store model in list
+  # Store model in list and save to disk
   secondary_models[[rg]] <- fit_resid
-  
-  # Save model to disk immediately
   saveRDS(fit_resid, paste0("secondary_model_", gsub(" ", "_", rg), ".rds"))
+  
   cat("Saved model for", rg, "to disk.\n\n")
 }
 
